@@ -185,6 +185,16 @@ jobs:
           echo "Adding ReSukiSU..."
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash $BRANCH
 
+
+      - name: Apply SUSFS Patches
+        working-directory: kernel
+        run: |
+          echo "Applying SUSFS patches..."
+
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./
+          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+
       - name: Configure kernel features
         working-directory: kernel
         run: |
@@ -194,6 +204,7 @@ jobs:
           echo "Using defconfig: $DEFCONFIG" | tee -a ../error-log-${{ matrix.device }}.txt
 
           echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
           echo "✓ Kernel configuration completed" | tee -a ../error-log-${{ matrix.device }}.txt
           echo "" >> ../error-log-${{ matrix.device }}.txt
 
