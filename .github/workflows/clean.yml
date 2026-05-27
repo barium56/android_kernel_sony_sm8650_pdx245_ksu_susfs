@@ -351,7 +351,7 @@ jobs:
           </details>
 
           ## Downloads:
-          - **pdx245 (Xperia 1 VI)**: AnyKernel3-pdx245-sukisu-*.zip
+          - **pdx245 (Xperia 1 VI)**: AnyKernel3-pdx245-sukisu.zip
 
           Modules:
           -> https://github.com/sidex15/ksu_module_susfs
@@ -384,7 +384,7 @@ jobs:
           # Copy pdx245 files
           cp artifacts/pdx245/Image-pdx245 release-assets/Image-pdx245
           cp artifacts/pdx245/build-info-pdx245.txt release-assets/build-info-pdx245.txt
-          cp artifacts/pdx245/AnyKernel3-pdx245-sukisu-*.zip release-assets/
+          cp artifacts/pdx245/AnyKernel3-pdx245-sukisu.zip release-assets/
 
       - name: Install GitHub CLI
         run: |
