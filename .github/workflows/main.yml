@@ -1,0 +1,386 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      sukisu_branch:
+        description: 'SukiSU Branch'
+        required: true
+        default: 'Stable(标准)'
+        type: choice
+        options:
+          - Stable(标准)
+          - Dev(开发)
+      enable_susfs:
+        description: 'Enable SUSFS'
+        required: true
+        default: true
+        type: boolean
+      enable_kpm:
+        description: 'Enable KPM (Kernel Patch Module)'
+        required: true
+        default: true
+        type: boolean
+      enable_zram:
+        description: 'Enable ZRAM optimizations (LZ4KD)'
+        required: true
+        default: true
+        type: boolean
+      release_version:
+        description: 'Release Version'
+        required: true
+        default: 'v2.0.0-r1'
+        type: string
+
+env:
+  AOSP_TOOLCHAIN_BRANCH: android16
+  AOSP_CLANG_VERSION: r547379
+  ANDROID_VERSION: android14
+  KERNEL_VERSION: 6.1
+
+jobs:
+  build:
+    name: Build ${{ matrix.device }}
+    permissions: { contents: write }
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        device: [pdx245]
+      fail-fast: false
+    steps:
+      - name: Maximize Build Space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          remove-large-packages: 'true'
+          remove-swapfile: 'true'
+          remove-cached-tools: 'false'
+          verbose: 'true'
+
+      - name: Install packages
+        env:
+          PACKAGES:
+            binutils-arm-linux-gnueabi
+            binutils-aarch64-linux-gnu
+            ccache
+            libelf-dev
+            libssl-dev
+            bc
+            bison
+            flex
+            python3
+            python-is-python3
+            dwarves
+            build-essential
+            libc6-dev
+            curl
+            git
+            zip
+            unzip
+            pigz
+        run: |
+          echo 'Acquire::Queue-Mode "host";' | sudo tee /etc/apt/apt.conf.d/99parallel
+          echo 'Acquire::http::Pipeline-Depth "5";' | sudo tee -a /etc/apt/apt.conf.d/99parallel
+          sudo apt update -qq
+          sudo apt install -y ${{ env.PACKAGES }} -qq
+
+      - name: Initialize error log
+        run: |
+          echo "=== Build Process Error and Warning Log ===" > error-log-${{ matrix.device }}.txt
+          echo "Build started: $(date -u)" >> error-log-${{ matrix.device }}.txt
+          echo "Device: ${{ matrix.device }}" >> error-log-${{ matrix.device }}.txt
+          echo "" >> error-log-${{ matrix.device }}.txt
+
+      - name: Checkout build configs
+        uses: actions/checkout@v6
+        with:
+          path: kernel
+
+      - name: Clean kernel build environment
+        working-directory: kernel
+        run: |
+          echo "Cleaning kernel build environment..." | tee -a ../error-log-${{ matrix.device }}.txt
+          make mrproper 2>&1 | tee -a ../error-log-${{ matrix.device }}.txt
+          echo "✓ Kernel environment cleaned" | tee -a ../error-log-${{ matrix.device }}.txt
+          echo "" >> ../error-log-${{ matrix.device }}.txt
+
+      - name: Install base defconfig from stock boot.img
+        working-directory: kernel
+        run: |
+          echo "--- Installing Base Defconfig ---" | tee -a ../error-log-${{ matrix.device }}.txt
+          cp ../kernel/${{ matrix.device }}_defconfig arch/arm64/configs/${{ matrix.device }}_defconfig
+          echo "✓ Installed stock defconfig ($(wc -l < arch/arm64/configs/${{ matrix.device }}_defconfig) lines)" | tee -a ../error-log-${{ matrix.device }}.txt
+          echo "" >> ../error-log-${{ matrix.device }}.txt
+
+      - name: Cache Clang
+        id: cache-clang
+        uses: actions/cache@v5
+        with:
+          path: clang
+          key: clang-${{ env.AOSP_TOOLCHAIN_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}
+
+      - name: Download Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading Clang..." | tee -a error-log-${{ matrix.device }}.txt
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.AOSP_TOOLCHAIN_BRANCH }}-release/clang-${{ env.AOSP_CLANG_VERSION }}.tar.gz"
+          curl -fSL \
+            --connect-timeout 30 \
+            --max-time 600 \
+            --retry 5 \
+            --retry-delay 10 \
+            --retry-max-time 300 \
+            --retry-connrefused \
+            -o clang.tar.gz \
+            "$URL" || { echo "Download failed"; exit 1; }
+      
+          if ! gzip -t clang.tar.gz; then
+            echo "Not a gzip file – checking content:"
+            file clang.tar.gz
+            head -c 300 clang.tar.gz
+            exit 1
+          fi
+      
+          mkdir -p clang
+          tar xzf clang.tar.gz -C clang
+          echo "✓ Clang downloaded and extracted" | tee -a error-log-${{ matrix.device }}.txt
+
+      - name: Cache ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ matrix.device }}-sukisu
+          restore-keys: kernel-${{ matrix.device }}-sukisu
+          max-size: 3G
+          save: true
+
+      - name: Setup swap
+        run: |
+          echo "Setting up swap..." | tee -a error-log-${{ matrix.device }}.txt
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo swapon -s
+          echo "✓ Swap configured" | tee -a error-log-${{ matrix.device }}.txt
+          echo "" >> error-log-${{ matrix.device }}.txt
+
+      - name: Configure git for clean build
+        working-directory: kernel
+        run: |
+          echo "--- Git Configuration ---" | tee -a ../error-log-${{ matrix.device }}.txt
+          git config --global user.email "spacealtctrl@pm.me"
+          git config --global user.name "spacealtctrl"
+          rm -rf .gitmodules 2>/dev/null || true
+          git rm --cached KernelSU 2>/dev/null || true
+
+          git add .
+          if git commit -m "Applied SukiSU patches and configurations" 2>&1 | tee -a ../error-log-${{ matrix.device }}.txt; then
+            echo "✓ Git commit successful" | tee -a ../error-log-${{ matrix.device }}.txt
+          else
+            echo "ℹ Git commit not needed or failed (continuing)" | tee -a ../error-log-${{ matrix.device }}.txt
+          fi
+          echo "" >> ../error-log-${{ matrix.device }}.txt
+
+      - name: Optimize ccache
+        run: |
+          echo "--- Ccache Optimization ---" | tee -a error-log-${{ matrix.device }}.txt
+          ccache -M 3Ga
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=1
+          ccache --set-config=max_size=3G
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
+          echo "CCACHE_COMPRESSLEVEL=1" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=3G" >> $GITHUB_ENV
+          echo "CCACHE_HARDLINK=true" >> $GITHUB_ENV
+          echo "✓ Ccache configured" | tee -a error-log-${{ matrix.device }}.txt
+          echo "" >> error-log-${{ matrix.device }}.txt
+
+      - name: Pre-build Setup
+        run: |
+          echo "--- Pre-build Setup ---" | tee -a error-log-${{ matrix.device }}.txt
+          sudo mkdir -p /mnt/tmpfs
+          sudo mount -t tmpfs -o size=10G tmpfs /mnt/tmpfs
+          mkdir -p /mnt/tmpfs/out
+          ln -sf /mnt/tmpfs/out kernel/out
+          echo "✓ tmpfs mounted and linked" | tee -a error-log-${{ matrix.device }}.txt
+          df -h | tee -a error-log-${{ matrix.device }}.txt
+          echo "" >> error-log-${{ matrix.device }}.txt
+
+      - name: Build kernel
+        working-directory: kernel
+        env:
+          MAKE_ARGS:
+            O=out LLVM=1 LLVM_IAS=1 ARCH=arm64
+            -j$(nproc --all) CC="ccache clang"
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            KCFLAGS="-Wframe-larger-than=15000"
+        run: |
+          echo "--- Kernel Build ---" | tee -a ../error-log-${{ matrix.device }}.txt
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          export PAHOLE=/usr/bin/pahole
+          export BTF_DEBUG_INFO=y
+          echo "Building with $(nproc --all) parallel jobs..." | tee -a ../error-log-${{ matrix.device }}.txt
+          echo "Build started: $(date -u)" | tee -a ../error-log-${{ matrix.device }}.txt
+
+          # Generate defconfig and prepare headers (flask.h etc) before full parallel build
+          make ${{ env.MAKE_ARGS }} ${{ matrix.device }}_defconfig 2>&1 | tee build.log
+          make ${{ env.MAKE_ARGS }} prepare 2>&1 | tee -a build.log
+
+          if make ${{ env.MAKE_ARGS }} all 2>&1 | tee -a build.log; then
+            echo "✓ Kernel build completed successfully" | tee -a ../error-log-${{ matrix.device }}.txt
+          else
+            echo "✗ ERROR: Kernel build failed!" | tee -a ../error-log-${{ matrix.device }}.txt
+            echo "Last 100 lines of build output:" | tee -a ../error-log-${{ matrix.device }}.txt
+            tail -100 build.log | tee -a ../error-log-${{ matrix.device }}.txt
+            exit 1
+          fi
+          echo "Build completed: $(date -u)" | tee -a ../error-log-${{ matrix.device }}.txt
+          echo "" >> ../error-log-${{ matrix.device }}.txt
+
+      - name: Verify kernel build
+        run: |
+          echo "--- Build Verification ---" | tee -a error-log-${{ matrix.device }}.txt
+          echo "Verifying kernel build..."
+          if [ ! -f "kernel/out/arch/arm64/boot/Image" ]; then
+            echo "✗ ERROR: Kernel Image not found! Build failed." | tee -a error-log-${{ matrix.device }}.txt
+            exit 1
+          fi
+          echo "✓ Build verified successfully:" | tee -a error-log-${{ matrix.device }}.txt
+          ls -lh kernel/out/arch/arm64/boot/Image | tee -a error-log-${{ matrix.device }}.txt
+          echo "" >> error-log-${{ matrix.device }}.txt
+
+      - name: Log build configuration
+        run: |
+          echo "=== Build Configuration Summary ===" | tee build-info-${{ matrix.device }}.txt
+          echo "Device: ${{ matrix.device }}" | tee -a build-info-${{ matrix.device }}.txt
+          echo "SukiSU Branch: ${{ github.event.inputs.sukisu_branch }}" | tee -a build-info-${{ matrix.device }}.txt
+          echo "SUSFS Enabled: ${{ github.event.inputs.enable_susfs }}" | tee -a build-info-${{ matrix.device }}.txt
+          echo "KPM Enabled: ${{ github.event.inputs.enable_kpm }}" | tee -a build-info-${{ matrix.device }}.txt
+          echo "ZRAM/LZ4KD Enabled: ${{ github.event.inputs.enable_zram }}" | tee -a build-info-${{ matrix.device }}.txt
+          echo "Release Version: ${{ github.event.inputs.release_version }}" | tee -a build-info-${{ matrix.device }}.txt
+          echo "Build Date: $(date -u)" | tee -a build-info-${{ matrix.device }}.txt
+          echo "Kernel Version: ${{ env.KERNEL_VERSION }}" | tee -a build-info-${{ matrix.device }}.txt
+          echo "Android Version: ${{ env.ANDROID_VERSION }}" | tee -a build-info-${{ matrix.device }}.txt
+          echo "Clang Version: ${{ env.AOSP_CLANG_VERSION }}" | tee -a build-info-${{ matrix.device }}.txt
+
+          echo "===================================" | tee -a build-info-${{ matrix.device }}.txt
+          echo "" | tee -a build-info-${{ matrix.device }}.txt
+
+          # Append complete error log
+          if [ -f "error-log-${{ matrix.device }}.txt" ]; then
+            cat error-log-${{ matrix.device }}.txt >> build-info-${{ matrix.device }}.txt
+          fi
+
+          # Add build warnings and errors summary
+          if [ -f "kernel/build.log" ]; then
+            echo "" >> build-info-${{ matrix.device }}.txt
+            echo "=== Build Warnings Summary ===" >> build-info-${{ matrix.device }}.txt
+            grep -i "warning:" kernel/build.log >> build-info-${{ matrix.device }}.txt || echo "No warnings found" >> build-info-${{ matrix.device }}.txt
+            echo "" >> build-info-${{ matrix.device }}.txt
+            echo "=== Build Errors Summary ===" >> build-info-${{ matrix.device }}.txt
+            grep -i "error:" kernel/build.log >> build-info-${{ matrix.device }}.txt || echo "No errors found" >> build-info-${{ matrix.device }}.txt
+          fi
+
+          echo "" >> build-info-${{ matrix.device }}.txt
+          echo "=== Summary Statistics ===" >> build-info-${{ matrix.device }}.txt
+          if [ -f "error-log-${{ matrix.device }}.txt" ]; then
+            SUCCESS=$(grep -c "✓" error-log-${{ matrix.device }}.txt || echo "0")
+            WARNINGS=$(grep -c "⚠" error-log-${{ matrix.device }}.txt || echo "0")
+            ERRORS=$(grep -c "✗" error-log-${{ matrix.device }}.txt || echo "0")
+            echo "Successful operations: $SUCCESS" >> build-info-${{ matrix.device }}.txt
+            echo "Warnings: $WARNINGS" >> build-info-${{ matrix.device }}.txt
+            echo "Errors: $ERRORS" >> build-info-${{ matrix.device }}.txt
+          fi
+          echo "===================================" >> build-info-${{ matrix.device }}.txt
+
+      - name: Save ccache stats
+        if: always()
+        run: |
+          ccache -s
+          echo "Ccache statistics saved"
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/WildPlusKernel/AnyKernel3.git -b gki-2.0 AnyKernel3-${{ matrix.device }}
+
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3-${{ matrix.device }}/
+
+          if [ "${{ github.event.inputs.sukisu_branch }}" == "Stable(标准)" ]; then
+            BRANCH_SUFFIX="stable"
+          else
+            BRANCH_SUFFIX="dev"
+          fi
+
+          cd AnyKernel3-${{ matrix.device }}
+          zip -r9 -q "../AnyKernel3-${{ matrix.device }}-sukisu-${BRANCH_SUFFIX}.zip" * -x .git .github README.md *placeholder
+          cd ..
+
+      - name: Copy kernel Image for upload
+        run: |
+          cp kernel/out/arch/arm64/boot/Image Image-${{ matrix.device }}
+
+      - name: Upload files
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.device }}-sukisu-${{ github.event.inputs.sukisu_branch == 'Stable(标准)' && 'stable' || 'dev' }}
+          path: |
+            AnyKernel3-${{ matrix.device }}-sukisu-${{ github.event.inputs.sukisu_branch == 'Stable(标准)' && 'stable' || 'dev' }}.zip
+            Image-${{ matrix.device }}
+            build-info-${{ matrix.device }}.txt
+          overwrite: true
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: success()
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts for pdx245
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-pdx245-sukisu-${{ github.event.inputs.sukisu_branch == 'Stable(标准)' && 'stable' || 'dev' }}
+          path: artifacts/pdx245
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+
+          # Copy pdx245 files
+          cp artifacts/pdx245/Image-pdx245 release-assets/Image-pdx245
+          cp artifacts/pdx245/build-info-pdx245.txt release-assets/build-info-pdx245.txt
+          cp artifacts/pdx245/AnyKernel3-pdx245-sukisu-*.zip release-assets/
+
+      - name: Install GitHub CLI
+        run: |
+          type -p gh >/dev/null || {
+            sudo apt update
+            sudo apt install -y gh
+          }
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ env.RELEASE_TAG }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ env.RELEASE_NAME }}" \
+            --notes-file release-notes.md \
+            --target "${{ github.sha }}" \
+            ${{ github.event.inputs.sukisu_branch == 'Dev(开发)' && '--prerelease' || '' }} \
+            release-assets/*
+
+      - name: Output release URL
+        run: |
+          echo "Release created successfully!"
+          echo "URL: https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}"
+          echo "Release type: ${{ github.event.inputs.sukisu_branch == 'Dev(开发)' && 'Pre-release' || 'Latest release' }}"
+          echo "Device: pdx245 (Sony Xperia 1 VI)"
