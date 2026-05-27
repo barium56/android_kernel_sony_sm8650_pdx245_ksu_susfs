@@ -129,12 +129,14 @@ jobs:
         run: |
           echo "Downloading Clang..." | tee -a error-log-${{ matrix.device }}.txt
           URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.AOSP_TOOLCHAIN_BRANCH }}-release/clang-${{ env.AOSP_CLANG_VERSION }}.tar.gz"
-          timeout 900 wget \
-            --tries=5 \
-            --wait=10 \
-            --connect-timeout=30 \
-            --timeout=600 \
-            -O clang.tar.gz \
+          curl -fCSL \
+            --connect-timeout 30 \
+            --max-time 600 \
+            --retry 5 \
+            --retry-delay 10 \
+            --retry-max-time 300 \
+            --retry-connrefused \
+            -o clang.tar.gz \
             "$URL" || { echo "Download failed"; exit 1; }
       
           if ! gzip -t clang.tar.gz; then
