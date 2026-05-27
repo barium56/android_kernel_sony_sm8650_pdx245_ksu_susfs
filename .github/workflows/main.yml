@@ -1,4 +1,4 @@
-name: Release
+name: KSU SUSFS Build
 
 on:
   workflow_dispatch:
@@ -185,77 +185,6 @@ jobs:
           echo "Adding ReSukiSU..."
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash $BRANCH
 
-      - name: Apply SUSFS Patches
-        working-directory: kernel
-        run: |
-          echo "Applying SUSFS patches..."
-
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
-
-          # Temporarily adjust source context before applying main patch, replacing the archived wild fix patch
-          echo "Temporarily adjust Android 14 6.1 namespace.c context"
-          sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c
-
-          patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
-
-          # Restore temporary context after main patch application to avoid unrelated source differences
-          echo "Restore Android 14 6.1 namespace.c temporary adjustment"
-          sed -i '/^#include "internal.h"$/a #include <trace/hooks/blk.h>' fs/namespace.c
-
-          # Android 14 - 6.1 fixes
-          if grep -q 'susfs_is_current_proc_umounted\|SUSFS_IS_INODE_SUS_MAP\|SUSFS_IS_INODE_OPEN_REDIRECT' ./fs/proc/base.c && ! grep -qF '#include <linux/susfs_def.h>' ./fs/proc/base.c; then
-            if grep -qF '#include <linux/dma-buf.h>' ./fs/proc/base.c; then
-              sed -i '/#include <linux\/dma-buf.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux\/susfs_def.h>\n#endif' ./fs/proc/base.c
-            else
-              sed -i '/#include <linux\/cpufreq_times.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux\/susfs_def.h>\n#endif' ./fs/proc/base.c
-            fi
-          fi
-          # Fix 6.1 LTS: SUSFS patch header hunk in namespace.c failed due to context mismatch,
-          # leaving SUSFS symbols (DEFAULT_KSU_MNT_ID, etc.) undeclared in the function body
-          if grep -q 'DEFAULT_KSU_MNT_ID\|susfs_mnt_id_ida' ./fs/namespace.c && ! grep -qF '#include <linux/susfs_def.h>' ./fs/namespace.c; then
-            echo "Detected namespace.c missing susfs_def.h, injecting declaration..."
-            sed -i '/#include <linux\/mnt_idmapping.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux\/susfs_def.h>\n#endif' ./fs/namespace.c
-            if ! grep -q 'extern bool susfs_is_current_ksu_domain' ./fs/namespace.c; then
-              sed -i '/#include "internal.h"/a \\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n#define CL_COPY_MNT_NS BIT(25)\n\n#endif' ./fs/namespace.c
-            fi
-          fi
-
-      - name: Apply Unicode Bypass Fix
-        working-directory: kernel
-        run: |
-          patch -p1 --forward < "$ACTION_BUILD/patches/unicode_bypass_fix_6.1+.patch" || true
-
-      - name: Add Baseband-guard support
-        working-directory: kernel
-        run: |
-          LOG="../error-log-${{ matrix.device }}.txt"
-
-          echo "--- Adding Baseband-guard ---" | tee -a "$LOG"
-          # Run setup.sh
-          if wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash 2>&1 | tee -a "$LOG"; then
-            echo "✓ Baseband-guard setup script completed" | tee -a "$LOG"
-          else
-            echo "⚠ Baseband-guard setup had issues (continuing)" | tee -a "$LOG"
-          fi
-
-          echo "Enabling Baseband-guard kernel configuration..." | tee -a "$LOG"
-          CONFIG_FILE="arch/arm64/configs/${{ matrix.device }}_defconfig"
-
-          # Add CONFIG_BBG=y if not already present
-          if grep -q '^CONFIG_BBG=y' "$CONFIG_FILE"; then
-            echo "ℹ CONFIG_BBG=y already present" | tee -a "$LOG"
-          else
-            echo 'CONFIG_BBG=y' >> "$CONFIG_FILE"
-            echo "✓ Added CONFIG_BBG=y to defconfig" | tee -a "$LOG"
-          fi
-
-          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
-
-          echo "✓ Baseband-guard configuration completed" | tee -a "$LOG"
-          echo "" >> "$LOG"
-
       - name: Configure kernel features
         working-directory: kernel
         run: |
@@ -265,36 +194,6 @@ jobs:
           echo "Using defconfig: $DEFCONFIG" | tee -a ../error-log-${{ matrix.device }}.txt
 
           echo "CONFIG_KSU=y" >> "$DEFCONFIG"
-          echo "CONFIG_KPM=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
-
-          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
-
-          echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
-          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP_NF_TARGET_TTL=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP6_NF_TARGET_HL=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP6_NF_MATCH_HL=y" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_BBR=y" >> "$DEFCONFIG"
-          echo "CONFIG_NET_SCH_FQ=y" >> "$DEFCONFIG"
-          echo "CONFIG_DEFAULT_BBR=y" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_BIC=n" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_WESTWOOD=n" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_HTCP=n" >> "$DEFCONFIG"
           echo "✓ Kernel configuration completed" | tee -a ../error-log-${{ matrix.device }}.txt
           echo "" >> ../error-log-${{ matrix.device }}.txt
 
@@ -503,7 +402,7 @@ jobs:
           </details>
 
           ## Downloads:
-          - **pdx245 (Xperia 1 VI)**: AnyKernel3-pdx245-sukisu-*.zip
+          - **pdx245 (Xperia 1 VI)**: AnyKernel3-pdx245-sukisu.zip
 
           Modules:
           -> https://github.com/sidex15/ksu_module_susfs
@@ -536,7 +435,7 @@ jobs:
           # Copy pdx245 files
           cp artifacts/pdx245/Image-pdx245 release-assets/Image-pdx245
           cp artifacts/pdx245/build-info-pdx245.txt release-assets/build-info-pdx245.txt
-          cp artifacts/pdx245/AnyKernel3-pdx245-sukisu-*.zip release-assets/
+          cp artifacts/pdx245/AnyKernel3-pdx245-sukisu.zip release-assets/
 
       - name: Install GitHub CLI
         run: |
