@@ -3,33 +3,10 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      sukisu_branch:
-        description: 'SukiSU Branch'
-        required: true
-        default: 'Stable(标准)'
-        type: choice
-        options:
-          - Stable(标准)
-          - Dev(开发)
-      enable_susfs:
-        description: 'Enable SUSFS'
-        required: true
-        default: true
-        type: boolean
-      enable_kpm:
-        description: 'Enable KPM (Kernel Patch Module)'
-        required: true
-        default: true
-        type: boolean
-      enable_zram:
-        description: 'Enable ZRAM optimizations (LZ4KD)'
-        required: true
-        default: true
-        type: boolean
       release_version:
         description: 'Release Version'
         required: true
-        default: 'v2.0.0-r1'
+        default: 'v1.0.0-r1'
         type: string
 
 env:
@@ -113,7 +90,7 @@ jobs:
         working-directory: kernel
         run: |
           echo "--- Installing Base Defconfig ---" | tee -a ../error-log-${{ matrix.device }}.txt
-          cp ../kernel/${{ matrix.device }}_defconfig arch/arm64/configs/${{ matrix.device }}_defconfig
+          mv ../kernel/${{ matrix.device }}_defconfig arch/arm64/configs/${{ matrix.device }}_defconfig
           echo "✓ Installed stock defconfig ($(wc -l < arch/arm64/configs/${{ matrix.device }}_defconfig) lines)" | tee -a ../error-log-${{ matrix.device }}.txt
           echo "" >> ../error-log-${{ matrix.device }}.txt
 
@@ -169,6 +146,158 @@ jobs:
           echo "✓ Swap configured" | tee -a error-log-${{ matrix.device }}.txt
           echo "" >> error-log-${{ matrix.device }}.txt
 
+      - name: Clone ReSukiSU and SUSFS dependencies
+        run: |
+          echo "--- Cloning Dependencies ---" | tee -a error-log-${{ matrix.device }}.txt
+          echo "Cloning ReSukiSU and SUSFS dependencies in parallel..."
+
+          # Set SUSFS branch dynamically based on kernel version
+          SUSFS_BRANCH="gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}"
+          echo "Using SUSFS branch: $SUSFS_BRANCH" | tee -a error-log-${{ matrix.device }}.txt
+
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" 2>&1 | tee -a error-log-${{ matrix.device }}.txt &
+          git clone --depth=1 https://github.com/WildPlusKernel/kernel_patches.git 2>&1 | tee -a error-log-${{ matrix.device }}.txt &
+          git clone --depth=1 https://github.com/Numbersf/Action-Build.git 2>&1 | tee -a error-log-${{ matrix.device }}.txt &
+
+          # Remove depth from SukiSU clone to allow checkout of specific commit for KPM later
+          git clone https://github.com/ShirkNeko/SukiSU_patch.git 2>&1 | tee -a error-log-${{ matrix.device }}.txt &
+
+          git clone --depth=1 https://github.com/zzh20188/GKI_KernelSU_SUSFS.git zzh_patches 2>&1 | tee -a error-log-${{ matrix.device }}.txt &
+          wait
+          echo "✓ Dependencies cloned successfully" | tee -a error-log-${{ matrix.device }}.txt
+
+          # Verify SukiSU_patch was cloned
+          if [ -d "SukiSU_patch" ]; then
+            echo "✓ SukiSU_patch repository verified" | tee -a error-log-${{ matrix.device }}.txt
+            ls -la SukiSU_patch/ | tee -a error-log-${{ matrix.device }}.txt
+          else
+            echo "✗ ERROR: SukiSU_patch repository not found!" | tee -a error-log-${{ matrix.device }}.txt
+            exit 1
+          fi
+
+          echo "" >> error-log-${{ matrix.device }}.txt
+
+      - name: Add KernelSU
+        working-directory: kernel
+        run: |
+          BRANCH="-s main"
+          echo "KSU branch: $BRANCH"
+          echo "Adding ReSukiSU..."
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash $BRANCH
+
+      - name: Apply SUSFS Patches
+        working-directory: kernel
+        run: |
+          echo "Applying SUSFS patches..."
+
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+          cp ../susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+
+          # Temporarily adjust source context before applying main patch, replacing the archived wild fix patch
+          echo "Temporarily adjust Android 14 6.1 namespace.c context"
+          sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c
+
+          patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+
+          # Restore temporary context after main patch application to avoid unrelated source differences
+          echo "Restore Android 14 6.1 namespace.c temporary adjustment"
+          sed -i '/^#include "internal.h"$/a #include <trace/hooks/blk.h>' fs/namespace.c
+
+          # Android 14 - 6.1 fixes
+          if grep -q 'susfs_is_current_proc_umounted\|SUSFS_IS_INODE_SUS_MAP\|SUSFS_IS_INODE_OPEN_REDIRECT' ./fs/proc/base.c && ! grep -qF '#include <linux/susfs_def.h>' ./fs/proc/base.c; then
+            if grep -qF '#include <linux/dma-buf.h>' ./fs/proc/base.c; then
+              sed -i '/#include <linux\/dma-buf.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux\/susfs_def.h>\n#endif' ./fs/proc/base.c
+            else
+              sed -i '/#include <linux\/cpufreq_times.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux\/susfs_def.h>\n#endif' ./fs/proc/base.c
+            fi
+          fi
+          # Fix 6.1 LTS: SUSFS patch header hunk in namespace.c failed due to context mismatch,
+          # leaving SUSFS symbols (DEFAULT_KSU_MNT_ID, etc.) undeclared in the function body
+          if grep -q 'DEFAULT_KSU_MNT_ID\|susfs_mnt_id_ida' ./fs/namespace.c && ! grep -qF '#include <linux/susfs_def.h>' ./fs/namespace.c; then
+            echo "Detected namespace.c missing susfs_def.h, injecting declaration..."
+            sed -i '/#include <linux\/mnt_idmapping.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux\/susfs_def.h>\n#endif' ./fs/namespace.c
+            if ! grep -q 'extern bool susfs_is_current_ksu_domain' ./fs/namespace.c; then
+              sed -i '/#include "internal.h"/a \\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n#define CL_COPY_MNT_NS BIT(25)\n\n#endif' ./fs/namespace.c
+            fi
+          fi
+
+      - name: Apply Unicode Bypass Fix
+        working-directory: kernel
+        run: |
+          patch -p1 --forward < "$ACTION_BUILD/patches/unicode_bypass_fix_6.1+.patch" || true
+
+      - name: Add Baseband-guard support
+        working-directory: kernel
+        run: |
+          LOG="../error-log-${{ matrix.device }}.txt"
+
+          echo "--- Adding Baseband-guard ---" | tee -a "$LOG"
+          # Run setup.sh
+          if wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash 2>&1 | tee -a "$LOG"; then
+            echo "✓ Baseband-guard setup script completed" | tee -a "$LOG"
+          else
+            echo "⚠ Baseband-guard setup had issues (continuing)" | tee -a "$LOG"
+          fi
+
+          echo "Enabling Baseband-guard kernel configuration..." | tee -a "$LOG"
+          CONFIG_FILE="arch/arm64/configs/${{ matrix.device }}_defconfig"
+
+          # Add CONFIG_BBG=y if not already present
+          if grep -q '^CONFIG_BBG=y' "$CONFIG_FILE"; then
+            echo "ℹ CONFIG_BBG=y already present" | tee -a "$LOG"
+          else
+            echo 'CONFIG_BBG=y' >> "$CONFIG_FILE"
+            echo "✓ Added CONFIG_BBG=y to defconfig" | tee -a "$LOG"
+          fi
+
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+
+          echo "✓ Baseband-guard configuration completed" | tee -a "$LOG"
+          echo "" >> "$LOG"
+
+      - name: Configure kernel features
+        working-directory: kernel
+        run: |
+          echo "--- Kernel Configuration ---" | tee -a ../error-log-${{ matrix.device }}.txt
+
+          DEFCONFIG="arch/arm64/configs/${{ matrix.device }}_defconfig"
+          echo "Using defconfig: $DEFCONFIG" | tee -a ../error-log-${{ matrix.device }}.txt
+
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+          echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
+
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
+
+          echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP_NF_TARGET_TTL=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP6_NF_TARGET_HL=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP6_NF_MATCH_HL=y" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_BBR=y" >> "$DEFCONFIG"
+          echo "CONFIG_NET_SCH_FQ=y" >> "$DEFCONFIG"
+          echo "CONFIG_DEFAULT_BBR=y" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_BIC=n" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_WESTWOOD=n" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_HTCP=n" >> "$DEFCONFIG"
+          echo "✓ Kernel configuration completed" | tee -a ../error-log-${{ matrix.device }}.txt
+          echo "" >> ../error-log-${{ matrix.device }}.txt
+
       - name: Configure git for clean build
         working-directory: kernel
         run: |
@@ -189,7 +318,7 @@ jobs:
       - name: Optimize ccache
         run: |
           echo "--- Ccache Optimization ---" | tee -a error-log-${{ matrix.device }}.txt
-          ccache -M 3Ga
+          ccache -M 3G
           ccache --set-config=compression=true
           ccache --set-config=compression_level=1
           ccache --set-config=max_size=3G
@@ -260,11 +389,6 @@ jobs:
         run: |
           echo "=== Build Configuration Summary ===" | tee build-info-${{ matrix.device }}.txt
           echo "Device: ${{ matrix.device }}" | tee -a build-info-${{ matrix.device }}.txt
-          echo "SukiSU Branch: ${{ github.event.inputs.sukisu_branch }}" | tee -a build-info-${{ matrix.device }}.txt
-          echo "SUSFS Enabled: ${{ github.event.inputs.enable_susfs }}" | tee -a build-info-${{ matrix.device }}.txt
-          echo "KPM Enabled: ${{ github.event.inputs.enable_kpm }}" | tee -a build-info-${{ matrix.device }}.txt
-          echo "ZRAM/LZ4KD Enabled: ${{ github.event.inputs.enable_zram }}" | tee -a build-info-${{ matrix.device }}.txt
-          echo "Release Version: ${{ github.event.inputs.release_version }}" | tee -a build-info-${{ matrix.device }}.txt
           echo "Build Date: $(date -u)" | tee -a build-info-${{ matrix.device }}.txt
           echo "Kernel Version: ${{ env.KERNEL_VERSION }}" | tee -a build-info-${{ matrix.device }}.txt
           echo "Android Version: ${{ env.ANDROID_VERSION }}" | tee -a build-info-${{ matrix.device }}.txt
@@ -312,14 +436,8 @@ jobs:
 
           cp kernel/out/arch/arm64/boot/Image AnyKernel3-${{ matrix.device }}/
 
-          if [ "${{ github.event.inputs.sukisu_branch }}" == "Stable(标准)" ]; then
-            BRANCH_SUFFIX="stable"
-          else
-            BRANCH_SUFFIX="dev"
-          fi
-
           cd AnyKernel3-${{ matrix.device }}
-          zip -r9 -q "../AnyKernel3-${{ matrix.device }}-sukisu-${BRANCH_SUFFIX}.zip" * -x .git .github README.md *placeholder
+          zip -r9 -q "../AnyKernel3-${{ matrix.device }}-sukisu.zip" * -x .git .github README.md *placeholder
           cd ..
 
       - name: Copy kernel Image for upload
@@ -327,11 +445,11 @@ jobs:
           cp kernel/out/arch/arm64/boot/Image Image-${{ matrix.device }}
 
       - name: Upload files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: kernel-${{ matrix.device }}-sukisu-${{ github.event.inputs.sukisu_branch == 'Stable(标准)' && 'stable' || 'dev' }}
+          name: kernel-${{ matrix.device }}-sukisu
           path: |
-            AnyKernel3-${{ matrix.device }}-sukisu-${{ github.event.inputs.sukisu_branch == 'Stable(标准)' && 'stable' || 'dev' }}.zip
+            AnyKernel3-${{ matrix.device }}-sukisu.zip
             Image-${{ matrix.device }}
             build-info-${{ matrix.device }}.txt
           overwrite: true
@@ -345,10 +463,71 @@ jobs:
       contents: write
     steps:
       - name: Download build artifacts for pdx245
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
-          name: kernel-pdx245-sukisu-${{ github.event.inputs.sukisu_branch == 'Stable(标准)' && 'stable' || 'dev' }}
+          name: kernel-pdx245-sukisu
           path: artifacts/pdx245
+
+      - name: Generate release tag and notes
+        id: release_info
+        run: |
+          TAG="pdx245-${{ github.event.inputs.release_version }}"
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+
+          # Create release name
+          RELEASE_NAME="pdx245 Kernel: SukiSU & SUSFS"
+          echo "RELEASE_NAME<<EOF" >> $GITHUB_ENV
+          echo "$RELEASE_NAME" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          # Create release notes
+          cat > release-notes.md << EOF
+          This release includes **SukiSU** for Sony Xperia 1 VI on LineageOS 23.2
+
+          ## Supported Device:
+          - **pdx245** - Sony Xperia 1 VI
+
+          Features:
+          -> SUSFS ඞ
+          -> Inline Hook
+          -> Baseband-guard Support
+          -> BBR Support
+          <details>
+          <summary>▸ Notes:</summary>
+
+          - Build for Sony Xperia 1 VI (pdx245)
+          - Based on LineageOS 23.2 kernel source (Android 14 base)
+          - In the latest version of susfs, flashing AK3 with Kernel Flasher may brick your device, try [Horizon Kernel Flasher](https://github.com/libxzr/HorizonKernelFlasher)
+          - Flash the AnyKernel3 zip for pdx245
+
+          </details>
+
+          ## Downloads:
+          - **pdx245 (Xperia 1 VI)**: AnyKernel3-pdx245-sukisu-*.zip
+
+          Modules:
+          -> https://github.com/sidex15/ksu_module_susfs
+
+          SukiSU Manager:
+          -> https://github.com/SukiSU-Ultra/SukiSU-Ultra
+
+          LZ4 1.10.0: Upgrade from [zzh20188/GKI_KernelSU_SUSFS](https://github.com/zzh20188/GKI_KernelSU_SUSFS)
+
+          <details>
+          <summary>▸ Commit Information</summary>
+
+          Build compiled with:
+          - **SukiSU Branch**: builtin
+          - **Device**: Sony Xperia 1 VI (pdx245)
+          - **Base Kernel**: ${{ env.KERNEL_VERSION }}
+          - **Android Version**: 16 (LineageOS 23.2)
+          - **Clang Version**: ${{ env.AOSP_CLANG_VERSION }}
+          - **Release Version**: ${{ github.event.inputs.release_version }}
+          - **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - **Workflow Run**: [#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          </details>
+          EOF
 
       - name: Prepare release assets
         run: |
@@ -375,12 +554,10 @@ jobs:
             --title "${{ env.RELEASE_NAME }}" \
             --notes-file release-notes.md \
             --target "${{ github.sha }}" \
-            ${{ github.event.inputs.sukisu_branch == 'Dev(开发)' && '--prerelease' || '' }} \
             release-assets/*
 
       - name: Output release URL
         run: |
           echo "Release created successfully!"
           echo "URL: https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}"
-          echo "Release type: ${{ github.event.inputs.sukisu_branch == 'Dev(开发)' && 'Pre-release' || 'Latest release' }}"
           echo "Device: pdx245 (Sony Xperia 1 VI)"
